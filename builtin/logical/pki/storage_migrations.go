@@ -84,7 +84,8 @@ func migrateStorage(ctx context.Context, b *backend, s logical.Storage) error {
 	var keyIdentifier keyID
 	if migrationInfo.legacyBundle != nil {
 		b.Logger().Info("performing PKI migration to new keys/issuers layout")
-		anIssuer, aKey, err := writeCaBundle(ctx, b, s, migrationInfo.legacyBundle, "current", "current")
+		sc := b.makeStorageContext(ctx, s)
+		anIssuer, aKey, err := sc.writeCaBundle(migrationInfo.legacyBundle, "current", "current")
 		if err != nil {
 			return err
 		}

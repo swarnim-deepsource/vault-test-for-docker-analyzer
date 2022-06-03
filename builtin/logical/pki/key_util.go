@@ -9,7 +9,6 @@ import (
 
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/helper/errutil"
-	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func comparePublicKey(ctx context.Context, b *backend, key *keyEntry, publicKey crypto.PublicKey) (bool, error) {
@@ -76,7 +75,7 @@ func getPublicKeyFromBytes(keyBytes []byte) (crypto.PublicKey, error) {
 	return signer.Public(), nil
 }
 
-func importKeyFromBytes(ctx context.Context, b *backend, s logical.Storage, keyValue string, keyName string) (*keyEntry, bool, error) {
+func importKeyFromBytes(sc *storageContext, keyValue string, keyName string) (*keyEntry, bool, error) {
 	signer, _, _, err := getSignerFromBytes([]byte(keyValue))
 	if err != nil {
 		return nil, false, err
@@ -86,7 +85,7 @@ func importKeyFromBytes(ctx context.Context, b *backend, s logical.Storage, keyV
 		return nil, false, errors.New("unsupported private key type within pem bundle")
 	}
 
-	key, existed, err := importKey(ctx, b, s, keyValue, keyName, privateKeyType)
+	key, existed, err := sc.importKey(keyValue, keyName, privateKeyType)
 	if err != nil {
 		return nil, false, err
 	}

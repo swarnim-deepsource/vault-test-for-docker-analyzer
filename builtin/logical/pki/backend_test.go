@@ -2674,7 +2674,8 @@ func TestBackend_SignSelfIssued(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	signingBundle, err := fetchCAInfo(context.Background(), b, &logical.Request{Storage: storage}, defaultRef, ReadOnlyUsage)
+	sc := b.makeStorageContext(context.Background(), storage)
+	signingBundle, err := sc.fetchCAInfo(defaultRef, ReadOnlyUsage)
 	if err != nil {
 		t.Fatal(err)
 	}

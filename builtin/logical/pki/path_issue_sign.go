@@ -265,7 +265,8 @@ func (b *backend) pathIssueSignCert(ctx context.Context, req *logical.Request, d
 	}
 
 	var caErr error
-	signingBundle, caErr := fetchCAInfo(ctx, b, req, issuerName, IssuanceUsage)
+	sc := b.makeStorageContext(ctx, req.Storage)
+	signingBundle, caErr := sc.fetchCAInfo(issuerName, IssuanceUsage)
 	if caErr != nil {
 		switch caErr.(type) {
 		case errutil.UserError:
@@ -287,7 +288,7 @@ func (b *backend) pathIssueSignCert(ctx context.Context, req *logical.Request, d
 	if useCSR {
 		parsedBundle, err = signCert(b, input, signingBundle, false, useCSRValues)
 	} else {
-		parsedBundle, err = generateCert(ctx, b, input, signingBundle, false, rand.Reader)
+		parsedBundle, err = generateCert(sc, input, signingBundle, false, rand.Reader)
 	}
 	if err != nil {
 		switch err.(type) {
