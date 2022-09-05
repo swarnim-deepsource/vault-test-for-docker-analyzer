@@ -73,10 +73,12 @@ CMD ["server", "-dev"]
 FROM registry.access.redhat.com/ubi8/ubi-minimal:8.6 as ubi
 
 ARG BIN_NAME
+
 # PRODUCT_VERSION is the version built dist/$TARGETOS/$TARGETARCH/$BIN_NAME,
 # which we COPY in later. Example: PRODUCT_VERSION=1.2.3.
 ARG PRODUCT_VERSION
 ARG PRODUCT_REVISION
+
 # TARGETARCH and TARGETOS are set automatically when --platform is provided.
 ARG TARGETOS TARGETARCH
 
