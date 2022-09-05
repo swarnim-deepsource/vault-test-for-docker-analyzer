@@ -1,6 +1,6 @@
 import { attr } from '@ember-data/model';
 import { computed } from '@ember/object';
-import Certificate from './pki-certificate';
+import Certificate from './pki/cert';
 
 export default Certificate.extend({
   DISPLAY_FIELDS: computed(function () {
@@ -63,7 +63,7 @@ export default Certificate.extend({
     label: 'PEM bundle',
     editType: 'file',
   }),
-  permittedDnsNames: attr('string', {
+  permittedDnsDomains: attr('string', {
     label: 'Permitted DNS domains',
   }),
   privateKeyFormat: attr('string', {
@@ -117,7 +117,7 @@ export default Certificate.extend({
             'keyType',
             'keyBits',
             'maxPathLength',
-            'permittedDnsNames',
+            'permittedDnsDomains',
             'excludeCnFromSans',
             'ou',
             'organization',

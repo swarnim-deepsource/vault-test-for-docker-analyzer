@@ -349,7 +349,7 @@ func (c *DebugCommand) generateIndex() error {
 
 		dir, file := filepath.Split(relPath)
 		if len(dir) != 0 {
-			dir = strings.TrimSuffix(dir, "/")
+			dir = filepath.Clean(dir)
 			filesArr := outputLayout[dir].(map[string]interface{})["files"]
 			outputLayout[dir].(map[string]interface{})["files"] = append(filesArr.([]string), file)
 		} else {
@@ -448,7 +448,7 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 	}
 
 	// Strip trailing slash before proceeding
-	c.flagOutput = strings.TrimSuffix(c.flagOutput, "/")
+	c.flagOutput = filepath.Clean(c.flagOutput)
 
 	// If compression is enabled, trim the extension so that the files are
 	// written to a directory even if compression somehow fails. We ensure the
@@ -1071,7 +1071,18 @@ func (c *DebugCommand) writeLogs(ctx context.Context) {
 	}
 	defer out.Close()
 
-	logCh, err := c.cachedClient.Sys().Monitor(ctx, "trace", c.logFormat)
+	// Create Monitor specific client based on the cached client
+	mClient, err := c.cachedClient.Clone()
+	if err != nil {
+		c.captureError("log", err)
+		return
+	}
+	mClient.SetToken(c.cachedClient.Token())
+
+	// Set timeout to match the context explicitly
+	mClient.SetClientTimeout(c.flagDuration + debugDurationGrace)
+
+	logCh, err := mClient.Sys().Monitor(ctx, "trace", c.logFormat)
 	if err != nil {
 		c.captureError("log", err)
 		return
@@ -1080,13 +1091,15 @@ func (c *DebugCommand) writeLogs(ctx context.Context) {
 	for {
 		select {
 		case log := <-logCh:
-			if !strings.HasSuffix(log, "\n") {
-				log += "\n"
-			}
-			_, err = out.WriteString(log)
-			if err != nil {
-				c.captureError("log", err)
-				return
+			if len(log) > 0 {
+				if !strings.HasSuffix(log, "\n") {
+					log += "\n"
+				}
+				_, err = out.WriteString(log)
+				if err != nil {
+					c.captureError("log", err)
+					return
+				}
 			}
 		case <-ctx.Done():
 			return
