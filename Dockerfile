@@ -29,7 +29,6 @@ ENV VERSION=$VERSION
 
 # Create a non-root user to run the software.
 RUN addgroup ${NAME} && adduser -S -G ${NAME} ${NAME}
-
 RUN apk add --no-cache libcap su-exec dumb-init tzdata
 
 COPY dist/$TARGETOS/$TARGETARCH/$BIN_NAME /bin/
