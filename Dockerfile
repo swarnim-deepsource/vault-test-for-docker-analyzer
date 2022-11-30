@@ -1,4 +1,8 @@
 ## DOCKERHUB DOCKERFILE ##
+FROM alpine:3.15 as base
+USER root
+
+## DOCKERHUB DOCKERFILE ##
 FROM alpine:3.15 as default
 
 ARG BIN_NAME
