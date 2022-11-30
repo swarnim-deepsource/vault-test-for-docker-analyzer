@@ -21,6 +21,7 @@ import (
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/base62"
 	"github.com/hashicorp/vault/helper/fairshare"
+	"github.com/hashicorp/vault/helper/locking"
 	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
@@ -86,6 +87,7 @@ type pendingInfo struct {
 	cachedLeaseInfo  *leaseEntry
 	timer            *time.Timer
 	revokesAttempted uint8
+	loginRole        string
 }
 
 // ExpirationManager is used by the Core to manage leases. Secrets
@@ -109,7 +111,7 @@ type ExpirationManager struct {
 	pending     sync.Map
 	nonexpiring sync.Map
 	leaseCount  int
-	pendingLock sync.RWMutex
+	pendingLock locking.DeadlockRWMutex
 
 	// A sync.Lock for every active leaseID
 	lockPerLease sync.Map
@@ -137,7 +139,7 @@ type ExpirationManager struct {
 	quitCh             chan struct{}
 
 	// do not hold coreStateLock in any API handler code - it is already held
-	coreStateLock     *DeadlockRWMutex
+	coreStateLock     *locking.DeadlockRWMutex
 	quitContext       context.Context
 	leaseCheckCounter *uint32
 
@@ -1775,10 +1777,10 @@ func (m *ExpirationManager) uniquePoliciesGc() {
 // Acquiring a lock from a leaseEntry is a bad idea because it could change
 // between loading and acquiring the lock. So we only provide an ID-based map, and the
 // locking discipline should be:
-//    1. Lock lease
-//    2. Load, or attempt to load, leaseEntry
-//    3. Modify leaseEntry and pendingMap (atomic wrt operations on this lease)
-//    4. Unlock lease
+//  1. Lock lease
+//  2. Load, or attempt to load, leaseEntry
+//  3. Modify leaseEntry and pendingMap (atomic wrt operations on this lease)
+//  4. Unlock lease
 //
 // The lock must be removed from the map when the lease is deleted, or is
 // found to not exist in storage. loadEntry does this whenever it returns
@@ -1877,6 +1879,7 @@ func (m *ExpirationManager) updatePendingInternal(le *leaseEntry) {
 			leaseCreated = true
 		}
 
+		pending.loginRole = le.LoginRole
 		pending.cachedLeaseInfo = m.inMemoryLeaseInfo(le)
 		m.pending.Store(le.LeaseID, pending)
 	}

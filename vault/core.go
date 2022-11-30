@@ -22,13 +22,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v2"
-
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 	aeadwrapper "github.com/hashicorp/go-kms-wrapping/wrappers/aead/v2"
+	"github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v2"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/mlock"
 	"github.com/hashicorp/go-secure-stdlib/reloadutil"
@@ -39,6 +38,7 @@ import (
 	"github.com/hashicorp/vault/audit"
 	"github.com/hashicorp/vault/command/server"
 	"github.com/hashicorp/vault/helper/identity/mfa"
+	"github.com/hashicorp/vault/helper/locking"
 	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/osutil"
@@ -97,6 +97,10 @@ const (
 	ForwardSSCTokenToActive = "new_token"
 
 	WrapperTypeHsmAutoDeprecated = wrapping.WrapperType("hsm-auto")
+
+	// undoLogsAreSafeStoragePath is a storage path that we write once we know undo logs are
+	// safe, so we don't have to keep checking all the time.
+	undoLogsAreSafeStoragePath = "core/raft/undo_logs_are_safe"
 )
 
 var (
@@ -247,6 +251,9 @@ type Core struct {
 	// serviceRegistration is the ServiceRegistration network
 	serviceRegistration sr.ServiceRegistration
 
+	// hcpLinkStatus is a string describing the status of HCP link connection
+	hcpLinkStatus HCPLinkStatus
+
 	// underlyingPhysical will always point to the underlying backend
 	// implementation. This is an un-trusted backend with durable data
 	underlyingPhysical physical.Backend
@@ -292,7 +299,7 @@ type Core struct {
 	auditBackends map[string]audit.Factory
 
 	// stateLock protects mutable state
-	stateLock DeadlockRWMutex
+	stateLock locking.DeadlockRWMutex
 	sealed    *uint32
 
 	standby              bool
@@ -513,6 +520,11 @@ type Core struct {
 	// pluginCatalog is used to manage plugin configurations
 	pluginCatalog *PluginCatalog
 
+	// The userFailedLoginInfo map has user failed login information.
+	// It has user information (alias-name and mount accessor) as a key
+	// and login counter, last failed login time as value
+	userFailedLoginInfo map[FailedLoginUser]*FailedLoginInfo
+
 	enableMlock bool
 
 	// This can be used to trigger operations to stop running when Vault is
@@ -627,6 +639,12 @@ type Core struct {
 	// only the active node will actually write the new version timestamp, a perf
 	// standby shouldn't rely on the stored version timestamps being present.
 	versionHistory map[string]VaultVersion
+
+	// effectiveSDKVersion contains the SDK version that standby nodes should use when
+	// heartbeating with the active node. Default to the current SDK version.
+	effectiveSDKVersion string
+
+	rollbackPeriod time.Duration
 }
 
 func (c *Core) HAState() consts.HAState {
@@ -757,6 +775,10 @@ type CoreConfig struct {
 
 	// DisableSSCTokens is used to disable the use of server side consistent tokens
 	DisableSSCTokens bool
+
+	EffectiveSDKVersion string
+
+	RollbackPeriod time.Duration
 }
 
 // GetServiceRegistration returns the config's ServiceRegistration, or nil if it does
@@ -838,6 +860,11 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		conf.NumExpirationWorkers = numExpirationWorkersDefault
 	}
 
+	effectiveSDKVersion := conf.EffectiveSDKVersion
+	if effectiveSDKVersion == "" {
+		effectiveSDKVersion = version.GetVersion().Version
+	}
+
 	// Setup the core
 	c := &Core{
 		entCore:              entCore{},
@@ -903,6 +930,8 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		enableResponseHeaderRaftNodeID: conf.EnableResponseHeaderRaftNodeID,
 		mountMigrationTracker:          &sync.Map{},
 		disableSSCTokens:               conf.DisableSSCTokens,
+		effectiveSDKVersion:            effectiveSDKVersion,
+		userFailedLoginInfo:            make(map[FailedLoginUser]*FailedLoginInfo),
 	}
 
 	c.standbyStopCh.Store(make(chan struct{}))
@@ -930,6 +959,11 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 	c.clusterAddr.Store(conf.ClusterAddr)
 	c.activeContextCancelFunc.Store((context.CancelFunc)(nil))
 	atomic.StoreInt64(c.keyRotateGracePeriod, int64(2*time.Minute))
+
+	c.hcpLinkStatus = HCPLinkStatus{
+		lock:             sync.RWMutex{},
+		ConnectionStatus: "disconnected",
+	}
 
 	c.raftInfo.Store((*raftInformation)(nil))
 
@@ -1020,6 +1054,11 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 	c.reloadFuncs = make(map[string][]reloadutil.ReloadFunc)
 	c.reloadFuncsLock.Unlock()
 	conf.ReloadFuncs = &c.reloadFuncs
+
+	c.rollbackPeriod = conf.RollbackPeriod
+	if conf.RollbackPeriod == 0 {
+		c.rollbackPeriod = time.Minute
+	}
 
 	// All the things happening below this are not required in
 	// recovery mode
@@ -1267,13 +1306,13 @@ func (c *Core) Unseal(key []byte) (bool, error) {
 }
 
 // unseal takes a key fragment and attempts to use it to unseal Vault.
-// Vault may remain unsealed afterwards even when no error is returned,
+// Vault may remain sealed afterwards even when no error is returned,
 // depending on whether enough key fragments were provided to meet the
 // target threshold.
 //
 // The provided key should be a recovery key fragment if the seal
 // is an autoseal, or a regular seal key fragment for shamir.  In
-// migration scenarios "seal" in the preceding sentance refers to
+// migration scenarios "seal" in the preceding sentence refers to
 // the migration seal in c.migrationInfo.seal.
 //
 // We use getUnsealKey to work out if we have enough fragments,
@@ -1517,13 +1556,13 @@ func (c *Core) getUnsealKey(ctx context.Context, seal Seal) ([]byte, error) {
 	} else {
 		unsealKey, err = shamir.Combine(c.unlockInfo.Parts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to compute combined key: %w", err)
+			return nil, &ErrInvalidKey{fmt.Sprintf("failed to compute combined key: %v", err)}
 		}
 	}
 
 	if seal.RecoveryKeySupported() {
 		if err := seal.VerifyRecoveryKey(ctx, unsealKey); err != nil {
-			return nil, err
+			return nil, &ErrInvalidKey{fmt.Sprintf("failed to verify recovery key: %v", err)}
 		}
 	}
 
@@ -2165,7 +2204,6 @@ func (s standardUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c
 	if err := c.setupQuotas(ctx, false); err != nil {
 		return err
 	}
-
 	if err := c.setupHeaderHMACKey(ctx, false); err != nil {
 		return err
 	}
@@ -2230,6 +2268,9 @@ func (s standardUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c
 		return err
 	}
 
+	c.metricsCh = make(chan struct{})
+	go c.emitMetricsActiveNode(c.metricsCh)
+
 	return nil
 }
 
@@ -2251,7 +2292,7 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 	defer func() {
 		if retErr != nil {
 			ctxCancelFunc()
-			c.preSeal()
+			_ = c.preSeal()
 		}
 	}()
 	c.logger.Info("post-unseal setup starting")
@@ -2263,9 +2304,9 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 	}
 
 	// Purge these for safety in case of a rekey
-	c.seal.SetBarrierConfig(ctx, nil)
+	_ = c.seal.SetBarrierConfig(ctx, nil)
 	if c.seal.RecoveryKeySupported() {
-		c.seal.SetRecoveryConfig(ctx, nil)
+		_ = c.seal.SetRecoveryConfig(ctx, nil)
 	}
 
 	if err := unsealer.unseal(ctx, c.logger, c); err != nil {
@@ -2287,9 +2328,6 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 		// surprised by this at the next need to unseal.
 		seal.StartHealthCheck()
 	}
-
-	c.metricsCh = make(chan struct{})
-	go c.emitMetrics(c.metricsCh)
 
 	// This is intentionally the last block in this function. We want to allow
 	// writes just before allowing client requests, to ensure everything has
@@ -2757,7 +2795,7 @@ func (c *Core) unsealKeyToMasterKey(ctx context.Context, seal Seal, combinedKey 
 
 		err := seal.GetAccess().Wrapper.(*aeadwrapper.ShamirWrapper).SetAesGcmKeyBytes(combinedKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to setup unseal key: %w", err)
+			return nil, &ErrInvalidKey{fmt.Sprintf("failed to setup unseal key: %v", err)}
 		}
 		storedKeys, err := seal.GetStoredKeys(ctx)
 		if storedKeys == nil && err == nil && allowMissing {
@@ -2829,6 +2867,7 @@ func (c *Core) AddLogger(logger log.Logger) {
 	c.allLoggers = append(c.allLoggers, logger)
 }
 
+// SetLogLevel sets logging level for all tracked loggers to the level provided
 func (c *Core) SetLogLevel(level log.Level) {
 	c.allLoggersLock.RLock()
 	defer c.allLoggersLock.RUnlock()
@@ -2837,17 +2876,22 @@ func (c *Core) SetLogLevel(level log.Level) {
 	}
 }
 
-func (c *Core) SetLogLevelByName(name string, level log.Level) error {
+// SetLogLevelByName sets the logging level of named logger to level provided
+// if it exists. Core.allLoggers is a slice and as such it is entirely possible
+// that multiple entries exist for the same name. Each instance will be modified.
+func (c *Core) SetLogLevelByName(name string, level log.Level) bool {
 	c.allLoggersLock.RLock()
 	defer c.allLoggersLock.RUnlock()
+
+	found := false
 	for _, logger := range c.allLoggers {
 		if logger.Name() == name {
 			logger.SetLevel(level)
-			return nil
+			found = true
 		}
 	}
 
-	return fmt.Errorf("logger %q does not exist", name)
+	return found
 }
 
 // SetConfig sets core's config object to the newly provided config.
@@ -3336,6 +3380,18 @@ func (c *Core) CheckPluginPerms(pluginName string) (err error) {
 	return err
 }
 
+func (c *Core) LoadNodeID() (string, error) {
+	raftNodeID := c.GetRaftNodeID()
+	if raftNodeID != "" {
+		return raftNodeID, nil
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	return hostname, nil
+}
+
 // DetermineRoleFromLoginRequestFromBytes will determine the role that should be applied to a quota for a given
 // login request, accepting a byte payload
 func (c *Core) DetermineRoleFromLoginRequestFromBytes(mountPoint string, payload []byte, ctx context.Context) string {
@@ -3371,4 +3427,65 @@ func (c *Core) DetermineRoleFromLoginRequest(mountPoint string, data map[string]
 		return ""
 	}
 	return resp.Data["role"].(string)
+}
+
+// ListMounts will provide a slice containing a deep copy each mount entry
+func (c *Core) ListMounts() ([]*MountEntry, error) {
+	c.mountsLock.RLock()
+	defer c.mountsLock.RUnlock()
+
+	var entries []*MountEntry
+
+	for _, entry := range c.mounts.Entries {
+		clone, err := entry.Clone()
+		if err != nil {
+			return nil, err
+		}
+
+		entries = append(entries, clone)
+	}
+
+	return entries, nil
+}
+
+// ListAuths will provide a slice containing a deep copy each auth entry
+func (c *Core) ListAuths() ([]*MountEntry, error) {
+	c.mountsLock.RLock()
+	defer c.mountsLock.RUnlock()
+
+	var entries []*MountEntry
+
+	for _, entry := range c.auth.Entries {
+		clone, err := entry.Clone()
+		if err != nil {
+			return nil, err
+		}
+
+		entries = append(entries, clone)
+	}
+
+	return entries, nil
+}
+
+type HCPLinkStatus struct {
+	lock             sync.RWMutex
+	ConnectionStatus string `json:"hcp_link_status,omitempty"`
+	ResourceIDOnHCP  string `json:"resource_ID_on_hcp,omitempty"`
+}
+
+func (c *Core) SetHCPLinkStatus(status, resourceID string) {
+	c.hcpLinkStatus.lock.Lock()
+	defer c.hcpLinkStatus.lock.Unlock()
+	c.hcpLinkStatus.ConnectionStatus = status
+	c.hcpLinkStatus.ResourceIDOnHCP = resourceID
+}
+
+func (c *Core) GetHCPLinkStatus() (string, string) {
+	c.hcpLinkStatus.lock.RLock()
+	defer c.hcpLinkStatus.lock.RUnlock()
+
+	status := c.hcpLinkStatus.ConnectionStatus
+	resourceID := c.hcpLinkStatus.ResourceIDOnHCP
+
+	return status, resourceID
 }

@@ -69,7 +69,7 @@ CMD ["server", "-dev"]
 
 
 ## UBI DOCKERFILE ##
-FROM registry.access.redhat.com/ubi8/ubi-minimal:8.6 as ubi
+FROM registry.access.redhat.com/ubi8/ubi-minimal:8.7 as ubi
 
 ARG BIN_NAME
 

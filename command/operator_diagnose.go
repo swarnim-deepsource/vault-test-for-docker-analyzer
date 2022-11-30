@@ -33,11 +33,10 @@ import (
 	srconsul "github.com/hashicorp/vault/serviceregistration/consul"
 	"github.com/hashicorp/vault/vault"
 	"github.com/hashicorp/vault/vault/diagnose"
+	"github.com/hashicorp/vault/vault/hcp_link"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
 )
-
-const OperatorDiagnoseEnableEnv = "VAULT_DIAGNOSE"
 
 const CoreConfigUninitializedErr = "Diagnose cannot attempt this step because core config could not be set."
 
@@ -446,26 +445,25 @@ func (c *OperatorDiagnoseCommand) offlineDiagnostics(ctx context.Context) error 
 		goto SEALFAIL
 	}
 
-	if seals != nil {
-		for _, seal := range seals {
-			// There is always one nil seal. We need to skip it so we don't start an empty Finalize-Seal-Shamir
-			// section.
-			if seal == nil {
-				continue
-			}
-			// Ensure that the seal finalizer is called, even if using verify-only
-			defer func(seal *vault.Seal) {
-				sealType := diagnose.CapitalizeFirstLetter((*seal).BarrierType().String())
-				finalizeSealContext, finalizeSealSpan := diagnose.StartSpan(ctx, "Finalize "+sealType+" Seal")
-				err = (*seal).Finalize(finalizeSealContext)
-				if err != nil {
-					diagnose.Fail(finalizeSealContext, "Error finalizing seal.")
-					diagnose.Advise(finalizeSealContext, "This likely means that the barrier is still in use; therefore, finalizing the seal timed out.")
-					finalizeSealSpan.End()
-				}
-				finalizeSealSpan.End()
-			}(&seal)
+	for _, seal := range seals {
+		// There is always one nil seal. We need to skip it so we don't start an empty Finalize-Seal-Shamir
+		// section.
+		if seal == nil {
+			continue
 		}
+		seal := seal // capture range variable
+		// Ensure that the seal finalizer is called, even if using verify-only
+		defer func(seal *vault.Seal) {
+			sealType := diagnose.CapitalizeFirstLetter((*seal).BarrierType().String())
+			finalizeSealContext, finalizeSealSpan := diagnose.StartSpan(ctx, "Finalize "+sealType+" Seal")
+			err = (*seal).Finalize(finalizeSealContext)
+			if err != nil {
+				diagnose.Fail(finalizeSealContext, "Error finalizing seal.")
+				diagnose.Advise(finalizeSealContext, "This likely means that the barrier is still in use; therefore, finalizing the seal timed out.")
+				finalizeSealSpan.End()
+			}
+			finalizeSealSpan.End()
+		}(&seal)
 	}
 
 	if barrierSeal == nil {
@@ -711,6 +709,49 @@ SEALFAIL:
 		}
 		return nil
 	})
+
+	// Checking HCP link to make sure Vault could connect to SCADA.
+	// If it could not connect to SCADA in 5 seconds, diagnose reports an issue
+	if !constants.IsEnterprise {
+		diagnose.Skipped(ctx, "HCP link check will not run on OSS Vault.")
+	} else {
+		if config.HCPLinkConf != nil {
+			// we need to override API and Passthrough capabilities
+			// as they could not be initialized when Vault http handler
+			// is not fully initialized
+			config.HCPLinkConf.EnablePassThroughCapability = false
+			config.HCPLinkConf.EnableAPICapability = false
+
+			diagnose.Test(ctx, "Check HCP Connection", func(ctx context.Context) error {
+				hcpLink, err := hcp_link.NewHCPLink(config.HCPLinkConf, vaultCore, server.logger)
+				if err != nil || hcpLink == nil {
+					return fmt.Errorf("failed to start HCP link, %w", err)
+				}
+
+				// check if a SCADA session is established successfully
+				deadline := time.Now().Add(5 * time.Second)
+				linkSessionStatus := "disconnected"
+				for time.Now().Before(deadline) {
+					linkSessionStatus = hcpLink.GetConnectionStatusMessage(hcpLink.GetScadaSessionStatus())
+					if linkSessionStatus == "connected" {
+						break
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+				if linkSessionStatus != "connected" {
+					return fmt.Errorf("failed to connect to HCP in 5 seconds. HCP session status is: %s", linkSessionStatus)
+				}
+
+				err = hcpLink.Shutdown()
+				if err != nil {
+					return fmt.Errorf("failed to shutdown HCP link: %w", err)
+				}
+
+				return nil
+			})
+		}
+	}
+
 	return nil
 }
 

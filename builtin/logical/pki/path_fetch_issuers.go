@@ -103,10 +103,10 @@ intermediate CAs and "permit" only for root CAs.`,
 	fields["usage"] = &framework.FieldSchema{
 		Type: framework.TypeCommaStringSlice,
 		Description: `Comma-separated list (or string slice) of usages for
-this issuer; valid values are "read-only", "issuing-certificates", and
-"crl-signing". Multiple values may be specified. Read-only is implicit
-and always set.`,
-		Default: []string{"read-only", "issuing-certificates", "crl-signing"},
+this issuer; valid values are "read-only", "issuing-certificates",
+"crl-signing", and "ocsp-signing". Multiple values may be specified. Read-only
+is implicit and always set.`,
+		Default: []string{"read-only", "issuing-certificates", "crl-signing", "ocsp-signing"},
 	}
 	fields["revocation_signature_algorithm"] = &framework.FieldSchema{
 		Type: framework.TypeString,
@@ -207,9 +207,12 @@ func respondReadIssuer(issuer *issuerEntry) (*logical.Response, error) {
 		respManualChain = append(respManualChain, string(entity))
 	}
 
-	revSigAlgStr := issuer.RevocationSigAlg.String()
-	if issuer.RevocationSigAlg == x509.UnknownSignatureAlgorithm {
-		revSigAlgStr = ""
+	revSigAlgStr, present := certutil.InvSignatureAlgorithmNames[issuer.RevocationSigAlg]
+	if !present {
+		revSigAlgStr = issuer.RevocationSigAlg.String()
+		if issuer.RevocationSigAlg == x509.UnknownSignatureAlgorithm {
+			revSigAlgStr = ""
+		}
 	}
 
 	data := map[string]interface{}{
@@ -239,9 +242,15 @@ func respondReadIssuer(issuer *issuerEntry) (*logical.Response, error) {
 		data["ocsp_servers"] = issuer.AIAURIs.OCSPServers
 	}
 
-	return &logical.Response{
+	response := &logical.Response{
 		Data: data,
-	}, nil
+	}
+
+	if issuer.RevocationSigAlg == x509.SHA256WithRSAPSS || issuer.RevocationSigAlg == x509.SHA384WithRSAPSS || issuer.RevocationSigAlg == x509.SHA512WithRSAPSS {
+		response.AddWarning("Issuer uses a PSS Revocation Signature Algorithm. This algorithm will be downgraded to PKCS#1v1.5 signature scheme on OCSP responses, due to limitations in the OCSP library.")
+	}
+
+	return response, nil
 }
 
 func (b *backend) pathUpdateIssuer(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -368,7 +377,7 @@ func (b *backend) pathUpdateIssuer(ctx context.Context, req *logical.Request, da
 		// cert itself.
 		cert, err := issuer.GetCertificate()
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse issuer's certificate: %v", err)
+			return nil, fmt.Errorf("unable to parse issuer's certificate: %w", err)
 		}
 		if (cert.KeyUsage&x509.KeyUsageCRLSign) == 0 && newUsage.HasUsage(CRLSigningUsage) {
 			return logical.ErrorResponse("This issuer's underlying certificate lacks the CRLSign KeyUsage value; unable to set CRLSigningUsage on this issuer as a result."), nil
@@ -581,7 +590,7 @@ func (b *backend) pathPatchIssuer(ctx context.Context, req *logical.Request, dat
 
 			cert, err := issuer.GetCertificate()
 			if err != nil {
-				return nil, fmt.Errorf("unable to parse issuer's certificate: %v", err)
+				return nil, fmt.Errorf("unable to parse issuer's certificate: %w", err)
 			}
 			if (cert.KeyUsage&x509.KeyUsageCRLSign) == 0 && newUsage.HasUsage(CRLSigningUsage) {
 				return logical.ErrorResponse("This issuer's underlying certificate lacks the CRLSign KeyUsage value; unable to set CRLSigningUsage on this issuer as a result."), nil

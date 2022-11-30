@@ -12,9 +12,11 @@ EXTERNAL_TOOLS_CI=\
 EXTERNAL_TOOLS=\
 	github.com/client9/misspell/cmd/misspell
 GOFMT_FILES?=$$(find . -name '*.go' | grep -v pb.go | grep -v vendor)
+SED?=$(shell command -v gsed || command -v sed)
 
 
-GO_VERSION_MIN=1.18.5
+GO_VERSION_MIN=$$(cat $(CURDIR)/.go-version)
+PROTOC_VERSION_MIN=3.21.7
 GO_CMD?=go
 CGO_ENABLED?=0
 ifneq ($(FDB_ENABLED), )
@@ -170,6 +172,7 @@ static-dist: ember-dist
 static-dist-dev: ember-dist-dev
 
 proto: bootstrap
+	@sh -c "'$(CURDIR)/scripts/protocversioncheck.sh' '$(PROTOC_VERSION_MIN)'"
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative vault/*.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative vault/activity/activity_log.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative helper/storagepacker/types.proto
@@ -183,12 +186,13 @@ proto: bootstrap
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative sdk/plugin/pb/*.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative vault/tokens/token.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative sdk/helper/pluginutil/*.proto
+	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative vault/hcp_link/proto/node_status/*.proto
 
 	# No additional sed expressions should be added to this list. Going forward
 	# we should just use the variable names choosen by protobuf. These are left
 	# here for backwards compatability, namely for SDK compilation.
-	sed -i -e 's/Id/ID/' vault/request_forwarding_service.pb.go
-	sed -i -e 's/Idp/IDP/' -e 's/Url/URL/' -e 's/Id/ID/' -e 's/IDentity/Identity/' -e 's/EntityId/EntityID/' -e 's/Api/API/' -e 's/Qr/QR/' -e 's/Totp/TOTP/' -e 's/Mfa/MFA/' -e 's/Pingid/PingID/' -e 's/namespaceId/namespaceID/' -e 's/Ttl/TTL/' -e 's/BoundCidrs/BoundCIDRs/' helper/identity/types.pb.go helper/identity/mfa/types.pb.go helper/storagepacker/types.pb.go sdk/plugin/pb/backend.pb.go sdk/logical/identity.pb.go vault/activity/activity_log.pb.go
+	$(SED) -i -e 's/Id/ID/' vault/request_forwarding_service.pb.go
+	$(SED) -i -e 's/Idp/IDP/' -e 's/Url/URL/' -e 's/Id/ID/' -e 's/IDentity/Identity/' -e 's/EntityId/EntityID/' -e 's/Api/API/' -e 's/Qr/QR/' -e 's/Totp/TOTP/' -e 's/Mfa/MFA/' -e 's/Pingid/PingID/' -e 's/namespaceId/namespaceID/' -e 's/Ttl/TTL/' -e 's/BoundCidrs/BoundCIDRs/' helper/identity/types.pb.go helper/identity/mfa/types.pb.go helper/storagepacker/types.pb.go sdk/plugin/pb/backend.pb.go sdk/logical/identity.pb.go vault/activity/activity_log.pb.go
 
 	# This will inject the sentinel struct tags as decorated in the proto files.
 	protoc-go-inject-tag -input=./helper/identity/types.pb.go
@@ -250,18 +254,48 @@ ci-verify:
 
 .NOTPARALLEL: ember-dist ember-dist-dev
 
-.PHONY: build
-# This is used for release builds by .github/workflows/build.yml
-build:
-	@echo "--> Building Vault $(VAULT_VERSION)"
-	@go build -v -tags "$(GO_TAGS)" -ldflags " -X github.com/hashicorp/vault/sdk/version.Version=$(VAULT_VERSION) -X github.com/hashicorp/vault/sdk/version.GitCommit=$(VAULT_REVISION) -X github.com/hashicorp/vault/sdk/version.BuildDate=$(VAULT_BUILD_DATE)" -o dist/
+# These crt targets are used for release builds by .github/workflows/build.yml
+# and for artifact_source:local Enos scenario variants.
+.PHONY: crt-build
+crt-build:
+	@$(CURDIR)/scripts/crt-builder.sh build
 
-.PHONY: version
-# This is used for release builds by .github/workflows/build.yml
-version:
-	@$(CURDIR)/scripts/version.sh sdk/version/version_base.go
+.PHONY: crt-build-ui
+crt-build-ui:
+	@$(CURDIR)/scripts/crt-builder.sh build-ui
 
-.PHONY: build-date
-# This is used for release builds by .github/workflows/build.yml
-build-date:
-	@$(CURDIR)/scripts/build_date.sh
+.PHONY: crt-bundle
+crt-bundle:
+	@$(CURDIR)/scripts/crt-builder.sh bundle
+
+.PHONY: crt-get-artifact-basename
+crt-get-artifact-basename:
+	@$(CURDIR)/scripts/crt-builder.sh artifact-basename
+
+.PHONY: crt-get-date
+crt-get-date:
+	@$(CURDIR)/scripts/crt-builder.sh date
+
+.PHONY: crt-get-revision
+crt-get-revision:
+	@$(CURDIR)/scripts/crt-builder.sh revision
+
+.PHONY: crt-get-version
+crt-get-version:
+	@$(CURDIR)/scripts/crt-builder.sh version
+
+.PHONY: crt-get-version-base
+crt-get-version-base:
+	@$(CURDIR)/scripts/crt-builder.sh version-base
+
+.PHONY: crt-get-version-pre
+crt-get-version-pre:
+	@$(CURDIR)/scripts/crt-builder.sh version-pre
+
+.PHONY: crt-get-version-meta
+crt-get-version-meta:
+	@$(CURDIR)/scripts/crt-builder.sh version-meta
+
+.PHONY: crt-prepare-legal
+crt-prepare-legal:
+	@$(CURDIR)/scripts/crt-builder.sh prepare-legal

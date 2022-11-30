@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -115,7 +116,16 @@ func (i issuerUsage) Names() string {
 	var names []string
 	var builtUsage issuerUsage
 
-	for name, usage := range namedIssuerUsages {
+	// Return the known set of usages in a sorted order to not have Terraform state files flipping
+	// saying values are different when it's the same list in a different order.
+	keys := make([]string, 0, len(namedIssuerUsages))
+	for k := range namedIssuerUsages {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, name := range keys {
+		usage := namedIssuerUsages[name]
 		if i.HasUsage(usage) {
 			names = append(names, name)
 			builtUsage.ToggleUsage(usage)
@@ -177,7 +187,12 @@ type keyConfigEntry struct {
 }
 
 type issuerConfigEntry struct {
-	DefaultIssuerId issuerID `json:"default"`
+	// This new fetchedDefault field allows us to detect if the default
+	// issuer was modified, in turn dispatching the timestamp updater
+	// if necessary.
+	fetchedDefault             issuerID `json:"-"`
+	DefaultIssuerId            issuerID `json:"default"`
+	DefaultFollowsLatestIssuer bool     `json:"default_follows_latest_issuer"`
 }
 
 type storageContext struct {
@@ -465,7 +480,7 @@ func (i issuerEntry) CanMaybeSignWithAlgo(algo x509.SignatureAlgorithm) error {
 
 	cert, err := i.GetCertificate()
 	if err != nil {
-		return fmt.Errorf("unable to parse issuer's potential signature algorithm types: %v", err)
+		return fmt.Errorf("unable to parse issuer's potential signature algorithm types: %w", err)
 	}
 
 	switch cert.PublicKeyAlgorithm {
@@ -648,6 +663,9 @@ func (sc *storageContext) deleteIssuer(id issuerID) (bool, error) {
 	wasDefault := false
 	if config.DefaultIssuerId == id {
 		wasDefault = true
+		// Overwrite the fetched default issuer as we're going to remove this
+		// entry.
+		config.fetchedDefault = issuerID("")
 		config.DefaultIssuerId = issuerID("")
 		if err := sc.setIssuersConfig(config); err != nil {
 			return wasDefault, err
@@ -690,6 +708,12 @@ func (sc *storageContext) importIssuer(certValue string, issuerName string) (*is
 	// Ensure this certificate is a usable as a CA certificate.
 	if !issuerCert.BasicConstraintsValid || !issuerCert.IsCA {
 		return nil, false, errutil.UserError{Err: "Refusing to import non-CA certificate"}
+	}
+
+	// Ensure this certificate has a parsed public key. Otherwise, we've
+	// likely been given a bad certificate.
+	if issuerCert.PublicKeyAlgorithm == x509.UnknownPublicKeyAlgorithm || issuerCert.PublicKey == nil {
+		return nil, false, errutil.UserError{Err: "Refusing to import CA certificate with empty PublicKey. This usually means the SubjectPublicKeyInfo field has an OID not recognized by Go, such as 1.2.840.113549.1.1.10 for rsaPSS."}
 	}
 
 	// Before we can import a known issuer, we first need to know if the issuer
@@ -896,7 +920,15 @@ func (sc *storageContext) setIssuersConfig(config *issuerConfigEntry) error {
 		return err
 	}
 
-	return sc.Storage.Put(sc.Context, json)
+	if err := sc.Storage.Put(sc.Context, json); err != nil {
+		return err
+	}
+
+	if err := sc.changeDefaultIssuerTimestamps(config.fetchedDefault, config.DefaultIssuerId); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (sc *storageContext) getIssuersConfig() (*issuerConfigEntry, error) {
@@ -911,6 +943,7 @@ func (sc *storageContext) getIssuersConfig() (*issuerConfigEntry, error) {
 			return nil, errutil.InternalError{Err: fmt.Sprintf("unable to decode issuer configuration: %v", err)}
 		}
 	}
+	issuerConfig.fetchedDefault = issuerConfig.DefaultIssuerId
 
 	return issuerConfig, nil
 }
@@ -1157,6 +1190,18 @@ func (sc *storageContext) getRevocationConfig() (*crlConfig, error) {
 		result.AutoRebuildGracePeriod = defaultCrlConfig.AutoRebuildGracePeriod
 		result.Version = 1
 	}
+	if result.Version == 1 {
+		if result.DeltaRebuildInterval == "" {
+			result.DeltaRebuildInterval = defaultCrlConfig.DeltaRebuildInterval
+		}
+		result.Version = 2
+	}
+
+	// Depending on client version, it's possible that the expiry is unset.
+	// This sets the default value to prevent issues in downstream code.
+	if result.Expiry == "" {
+		result.Expiry = defaultCrlConfig.Expiry
+	}
 
 	return &result, nil
 }
@@ -1177,6 +1222,10 @@ func (sc *storageContext) getAutoTidyConfig() (*tidyConfig, error) {
 		return nil, err
 	}
 
+	if result.IssuerSafetyBuffer == 0 {
+		result.IssuerSafetyBuffer = defaultTidyConfig.IssuerSafetyBuffer
+	}
+
 	return &result, nil
 }
 
@@ -1187,4 +1236,13 @@ func (sc *storageContext) writeAutoTidyConfig(config *tidyConfig) error {
 	}
 
 	return sc.Storage.Put(sc.Context, entry)
+}
+
+func (sc *storageContext) listRevokedCerts() ([]string, error) {
+	list, err := sc.Storage.List(sc.Context, revokedPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed listing revoked certs: %w", err)
+	}
+
+	return list, err
 }

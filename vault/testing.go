@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"github.com/hashicorp/vault/audit"
 	"github.com/hashicorp/vault/builtin/credential/approle"
 	"github.com/hashicorp/vault/command/server"
+	"github.com/hashicorp/vault/helper/constants"
 	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/internalshared/configutil"
@@ -225,6 +227,8 @@ func TestCoreWithSealAndUINoCleanup(t testing.T, opts *CoreConfig) *Core {
 		conf.AuditBackends[k] = v
 	}
 
+	conf.ActivityLogConfig = opts.ActivityLogConfig
+
 	c, err := NewCore(conf)
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -351,6 +355,10 @@ func TestCoreUnseal(core *Core, key []byte) (bool, error) {
 	return core.Unseal(key)
 }
 
+func TestCoreSeal(core *Core) error {
+	return core.sealInternal()
+}
+
 // TestCoreUnsealed returns a pure in-memory core that is already
 // initialized and unsealed.
 func TestCoreUnsealed(t testing.T) (*Core, [][]byte, string) {
@@ -359,16 +367,21 @@ func TestCoreUnsealed(t testing.T) (*Core, [][]byte, string) {
 	return testCoreUnsealed(t, core)
 }
 
+func SetupMetrics(conf *CoreConfig) *metrics.InmemSink {
+	inmemSink := metrics.NewInmemSink(1000000*time.Hour, 2000000*time.Hour)
+	conf.MetricSink = metricsutil.NewClusterMetricSink("test-cluster", inmemSink)
+	conf.MetricsHelper = metricsutil.NewMetricsHelper(inmemSink, false)
+	return inmemSink
+}
+
 func TestCoreUnsealedWithMetrics(t testing.T) (*Core, [][]byte, string, *metrics.InmemSink) {
 	t.Helper()
-	inmemSink := metrics.NewInmemSink(1000000*time.Hour, 2000000*time.Hour)
 	conf := &CoreConfig{
 		BuiltinRegistry: NewMockBuiltinRegistry(),
-		MetricSink:      metricsutil.NewClusterMetricSink("test-cluster", inmemSink),
-		MetricsHelper:   metricsutil.NewMetricsHelper(inmemSink, false),
 	}
+	sink := SetupMetrics(conf)
 	core, keys, root := testCoreUnsealed(t, TestCoreWithSealAndUI(t, conf))
-	return core, keys, root, inmemSink
+	return core, keys, root, sink
 }
 
 // TestCoreUnsealedRaw returns a pure in-memory core that is already
@@ -389,19 +402,24 @@ func TestCoreUnsealedWithConfig(t testing.T, conf *CoreConfig) (*Core, [][]byte,
 
 func testCoreUnsealed(t testing.T, core *Core) (*Core, [][]byte, string) {
 	t.Helper()
+	token, keys := TestInitUnsealCore(t, core)
+
+	testCoreAddSecretMount(t, core, token)
+	return core, keys, token
+}
+
+func TestInitUnsealCore(t testing.T, core *Core) (string, [][]byte) {
 	keys, token := TestCoreInit(t, core)
 	for _, key := range keys {
 		if _, err := TestCoreUnseal(core, TestKeyCopy(key)); err != nil {
 			t.Fatalf("unseal err: %s", err)
 		}
 	}
-
 	if core.Sealed() {
 		t.Fatal("should not be sealed")
 	}
 
-	testCoreAddSecretMount(t, core, token)
-	return core, keys, token
+	return token, keys
 }
 
 func testCoreAddSecretMount(t testing.T, core *Core, token string) {
@@ -492,12 +510,17 @@ func TestDynamicSystemView(c *Core, ns *namespace.Namespace) *dynamicSystemView 
 		me.namespace = ns
 	}
 
-	return &dynamicSystemView{c, me}
+	return &dynamicSystemView{c, me, c.perfStandby}
 }
 
 // TestAddTestPlugin registers the testFunc as part of the plugin command to the
 // plugin catalog. If provided, uses tmpDir as the plugin directory.
-func TestAddTestPlugin(t testing.T, c *Core, name string, pluginType consts.PluginType, testFunc string, env []string, tempDir string) {
+// NB: The test func you pass in MUST be in the same package as the parent test,
+// or the test func won't be compiled into the test binary being run and the output
+// will be something like:
+// stderr (ignored by go-plugin): "testing: warning: no tests to run"
+// stdout: "PASS"
+func TestAddTestPlugin(t testing.T, c *Core, name string, pluginType consts.PluginType, version string, testFunc string, env []string, tempDir string) {
 	file, err := os.Open(os.Args[0])
 	if err != nil {
 		t.Fatal(err)
@@ -559,7 +582,6 @@ func TestAddTestPlugin(t testing.T, c *Core, name string, pluginType consts.Plug
 	c.pluginCatalog.directory = fullPath
 
 	args := []string{fmt.Sprintf("--test.run=%s", testFunc)}
-	version := ""
 	err = c.pluginCatalog.Set(context.Background(), name, pluginType, version, fileName, args, env, sum)
 	if err != nil {
 		t.Fatal(err)
@@ -880,9 +902,14 @@ type TestCluster struct {
 	base              *CoreConfig
 	LicensePublicKey  ed25519.PublicKey
 	LicensePrivateKey ed25519.PrivateKey
+	opts              *TestClusterOptions
 }
 
 func (c *TestCluster) Start() {
+}
+
+func (c *TestCluster) start(t testing.T) {
+	t.Helper()
 	for i, core := range c.Cores {
 		if core.Server != nil {
 			for _, ln := range core.Listeners {
@@ -893,6 +920,54 @@ func (c *TestCluster) Start() {
 	}
 	if c.SetupFunc != nil {
 		c.SetupFunc()
+	}
+
+	if c.opts != nil && c.opts.SkipInit {
+		// SkipInit implies that vault may not be ready to service requests, or that
+		// we're restarting a cluster from an existing storage.
+		return
+	}
+
+	activeCore := -1
+WAITACTIVE:
+	for i := 0; i < 60; i++ {
+		for i, core := range c.Cores {
+			if standby, _ := core.Core.Standby(); !standby {
+				activeCore = i
+				break WAITACTIVE
+			}
+		}
+
+		time.Sleep(time.Second)
+	}
+	if activeCore == -1 {
+		t.Fatalf("no core became active")
+	}
+
+	switch {
+	case c.opts == nil:
+	case c.opts.NoDefaultQuotas:
+	case c.opts.HandlerFunc == nil:
+	// If no HandlerFunc is provided that means that we can't actually do
+	// regular vault requests.
+	case reflect.TypeOf(c.opts.HandlerFunc).PkgPath() != "github.com/hashicorp/vault/http":
+	case reflect.TypeOf(c.opts.HandlerFunc).Name() != "Handler":
+	default:
+		cli := c.Cores[activeCore].Client
+		_, err := cli.Logical().Write("sys/quotas/rate-limit/rl-NewTestCluster", map[string]interface{}{
+			"rate": 1000000,
+		})
+		if err != nil {
+			t.Fatalf("error setting up global rate limit quota: %v", err)
+		}
+		if constants.IsEnterprise {
+			_, err = cli.Logical().Write("sys/quotas/lease-count/lc-NewTestCluster", map[string]interface{}{
+				"max_leases": 1000000,
+			})
+			if err != nil {
+				t.Fatalf("error setting up global lease count quota: %v", err)
+			}
+		}
 	}
 }
 
@@ -1125,10 +1200,14 @@ type PhysicalBackendBundle struct {
 	Cleanup   func()
 }
 
+type HandlerHandler interface {
+	Handler(*HandlerProperties) http.Handler
+}
+
 type TestClusterOptions struct {
 	KeepStandbysSealed       bool
 	SkipInit                 bool
-	HandlerFunc              func(*HandlerProperties) http.Handler
+	HandlerFunc              HandlerHandler
 	DefaultHandlerProperties HandlerProperties
 
 	// BaseListenAddress is used to explicitly assign ports in sequence to the
@@ -1197,8 +1276,12 @@ type TestClusterOptions struct {
 	LicensePrivateKey     ed25519.PrivateKey
 
 	// this stores the vault version that should be used for each core config
-	VersionMap        map[int]string
-	RedundancyZoneMap map[int]string
+	VersionMap             map[int]string
+	RedundancyZoneMap      map[int]string
+	KVVersion              string
+	EffectiveSDKVersionMap map[int]string
+
+	NoDefaultQuotas bool
 }
 
 var DefaultNumCores = 3
@@ -1623,6 +1706,8 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.EnableResponseHeaderHostname = base.EnableResponseHeaderHostname
 		coreConfig.EnableResponseHeaderRaftNodeID = base.EnableResponseHeaderRaftNodeID
 
+		coreConfig.RollbackPeriod = base.RollbackPeriod
+
 		testApplyEntBaseConfig(coreConfig, base)
 	}
 	if coreConfig.ClusterName == "" {
@@ -1777,6 +1862,8 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		}
 	}
 
+	testCluster.opts = opts
+	testCluster.start(t)
 	return &testCluster
 }
 
@@ -1886,6 +1973,11 @@ func (testCluster *TestCluster) newCore(t testing.T, idx int, coreConfig *CoreCo
 	if coreConfig.Logger == nil || (opts != nil && opts.Logger != nil) {
 		localConfig.Logger = testCluster.Logger.Named(fmt.Sprintf("core%d", idx))
 	}
+
+	if opts != nil && opts.EffectiveSDKVersionMap != nil {
+		localConfig.EffectiveSDKVersion = opts.EffectiveSDKVersionMap[idx]
+	}
+
 	if opts != nil && opts.PhysicalFactory != nil {
 		pfc := opts.PhysicalFactoryConfig
 		if pfc == nil {
@@ -1968,7 +2060,7 @@ func (testCluster *TestCluster) newCore(t testing.T, idx int, coreConfig *CoreCo
 		if props.ListenerConfig != nil && props.ListenerConfig.MaxRequestDuration == 0 {
 			props.ListenerConfig.MaxRequestDuration = DefaultMaxRequestDuration
 		}
-		handler = opts.HandlerFunc(&props)
+		handler = opts.HandlerFunc.Handler(&props)
 	}
 
 	// Set this in case the Seal was manually set before the core was
@@ -2075,6 +2167,11 @@ func (tc *TestCluster) initCores(t testing.T, opts *TestClusterOptions, addAudit
 
 	TestWaitActive(t, leader.Core)
 
+	kvVersion := "1"
+	if opts != nil {
+		kvVersion = opts.KVVersion
+	}
+
 	// Existing tests rely on this; we can make a toggle to disable it
 	// later if we want
 	kvReq := &logical.Request{
@@ -2086,7 +2183,7 @@ func (tc *TestCluster) initCores(t testing.T, opts *TestClusterOptions, addAudit
 			"path":        "secret/",
 			"description": "key/value secret storage",
 			"options": map[string]string{
-				"version": "1",
+				"version": kvVersion,
 			},
 		},
 	}
@@ -2213,6 +2310,7 @@ func NewMockBuiltinRegistry() *mockBuiltinRegistry {
 			"postgresql-database-plugin": consts.PluginTypeDatabase,
 			"approle":                    consts.PluginTypeCredential,
 			"aws":                        consts.PluginTypeCredential,
+			"consul":                     consts.PluginTypeSecrets,
 		},
 	}
 }
@@ -2221,7 +2319,6 @@ type mockBuiltinRegistry struct {
 	forTesting map[string]consts.PluginType
 }
 
-// Get only supports getting database plugins, and approle
 func (m *mockBuiltinRegistry) Get(name string, pluginType consts.PluginType) (func() (interface{}, error), bool) {
 	testPluginType, ok := m.forTesting[name]
 	if !ok {
@@ -2231,28 +2328,35 @@ func (m *mockBuiltinRegistry) Get(name string, pluginType consts.PluginType) (fu
 		return nil, false
 	}
 
-	if name == "approle" {
+	switch name {
+	case "approle":
 		return toFunc(approle.Factory), true
-	}
-
-	if name == "aws" {
+	case "aws":
 		return toFunc(func(ctx context.Context, config *logical.BackendConfig) (logical.Backend, error) {
 			b := new(framework.Backend)
 			b.Setup(ctx, config)
 			b.BackendType = logical.TypeCredential
 			return b, nil
 		}), true
-	}
-
-	if name == "postgresql-database-plugin" {
+	case "postgresql-database-plugin":
 		return toFunc(func(ctx context.Context, config *logical.BackendConfig) (logical.Backend, error) {
 			b := new(framework.Backend)
 			b.Setup(ctx, config)
 			b.BackendType = logical.TypeLogical
 			return b, nil
 		}), true
+	case "mysql-database-plugin":
+		return dbMysql.New(dbMysql.DefaultUserNameTemplate), true
+	case "consul":
+		return toFunc(func(ctx context.Context, config *logical.BackendConfig) (logical.Backend, error) {
+			b := new(framework.Backend)
+			b.Setup(ctx, config)
+			b.BackendType = logical.TypeLogical
+			return b, nil
+		}), true
+	default:
+		return nil, false
 	}
-	return dbMysql.New(dbMysql.DefaultUserNameTemplate), true
 }
 
 // Keys only supports getting a realistic list of the keys for database plugins,
@@ -2278,7 +2382,9 @@ func (m *mockBuiltinRegistry) Keys(pluginType consts.PluginType) []string {
 			"mongodbatlas-database-plugin",
 			"mssql-database-plugin",
 			"postgresql-database-plugin",
+			"redis-elasticache-database-plugin",
 			"redshift-database-plugin",
+			"redis-database-plugin",
 			"snowflake-database-plugin",
 		}
 	case consts.PluginTypeCredential:
@@ -2405,33 +2511,6 @@ func RetryUntil(t testing.T, timeout time.Duration, f func() error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("did not complete before deadline, err: %v", err)
-}
-
-// CreateTestClusterWithRollbackPeriod lets us modify the periodic func
-// invocation time period to some other value.
-//
-// Because multiple tests in the PKI mount use this helper, we've added
-// a lock around it and created the cluster immediately in this helper.
-// This ensures the tests don't race against each other.
-var rollbackPeriodLock sync.Mutex
-
-func CreateTestClusterWithRollbackPeriod(t testing.T, newPeriod time.Duration, base *CoreConfig, opts *TestClusterOptions) *TestCluster {
-	rollbackPeriodLock.Lock()
-	defer rollbackPeriodLock.Unlock()
-
-	// Set the period
-	oldPeriod := rollbackPeriod
-
-	// Create and start a new cluster.
-	rollbackPeriod = newPeriod
-	cluster := NewTestCluster(t, base, opts)
-	cluster.Start()
-
-	// Reset the period
-	rollbackPeriod = oldPeriod
-
-	// Return the cluster.
-	return cluster
 }
 
 // MakeTestPluginDir creates a temporary directory suitable for holding plugins.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -130,6 +129,7 @@ type Method struct {
 	MaxBackoffRaw interface{}   `hcl:"max_backoff"`
 	MaxBackoff    time.Duration `hcl:"-"`
 	Namespace     string        `hcl:"namespace"`
+	ExitOnError   bool          `hcl:"exit_on_err"`
 	Config        map[string]interface{}
 }
 
@@ -172,7 +172,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// Read the file
-	d, err := ioutil.ReadFile(path)
+	d, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

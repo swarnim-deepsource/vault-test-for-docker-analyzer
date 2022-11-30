@@ -161,7 +161,8 @@ type ActivityLog struct {
 
 	// channel closed when deletion at startup is done
 	// (for unit test robustness)
-	retentionDone chan struct{}
+	retentionDone         chan struct{}
+	computationWorkerDone chan struct{}
 
 	// for testing: is config currently being invalidated. protected by l
 	configInvalidationInProgress bool
@@ -1062,15 +1063,19 @@ func (c *Core) setupActivityLog(ctx context.Context, wg *sync.WaitGroup) error {
 		go manager.activeFragmentWorker(ctx)
 
 		// Check for any intent log, in the background
-		go manager.precomputedQueryWorker(ctx)
+		manager.computationWorkerDone = make(chan struct{})
+		go func() {
+			manager.precomputedQueryWorker(ctx)
+			close(manager.computationWorkerDone)
+		}()
 
 		// Catch up on garbage collection
 		// Signal when this is done so that unit tests can proceed.
 		manager.retentionDone = make(chan struct{})
-		go func() {
-			manager.retentionWorker(ctx, time.Now(), manager.retentionMonths)
+		go func(months int) {
+			manager.retentionWorker(ctx, time.Now(), months)
 			close(manager.retentionDone)
-		}()
+		}(manager.retentionMonths)
 	}
 
 	return nil
@@ -1198,6 +1203,11 @@ func (a *ActivityLog) activeFragmentWorker(ctx context.Context) {
 		endOfMonth.Stop()
 	}
 
+	endOfMonthChannel := endOfMonth.C
+	if a.core.activityLogConfig.DisableTimers {
+		endOfMonthChannel = nil
+	}
+
 	writeFunc := func() {
 		ctx, cancel := context.WithTimeout(ctx, activitySegmentWriteTimeout)
 		defer cancel()
@@ -1212,6 +1222,7 @@ func (a *ActivityLog) activeFragmentWorker(ctx context.Context) {
 	a.l.RLock()
 	doneCh := a.doneCh
 	a.l.RUnlock()
+
 	for {
 		select {
 		case <-doneCh:
@@ -1241,7 +1252,7 @@ func (a *ActivityLog) activeFragmentWorker(ctx context.Context) {
 
 			// Simpler, but ticker.Reset was introduced in go 1.15:
 			// ticker.Reset(activitySegmentInterval)
-		case currentTime := <-endOfMonth.C:
+		case currentTime := <-endOfMonthChannel:
 			err := a.HandleEndOfMonth(ctx, currentTime.UTC())
 			if err != nil {
 				a.logger.Error("failed to perform end of month rotation", "error", err)
@@ -1535,10 +1546,19 @@ func (a *ActivityLog) handleQuery(ctx context.Context, startTime, endTime time.T
 			return nil, err
 		}
 		if storedQuery == nil {
-			return nil, nil
+			// If the storedQuery is nil, that means there's no historical data to process. But, it's possible there's
+			// still current month data to process, so rather than returning a 204, let's proceed along like we're
+			// just querying the current month.
+			storedQuery = &activity.PrecomputedQuery{
+				StartTime:  startTime,
+				EndTime:    endTime,
+				Namespaces: make([]*activity.NamespaceRecord, 0),
+				Months:     make([]*activity.MonthRecord, 0),
+			}
 		}
 		pq = storedQuery
 	}
+
 	// Calculate the namespace response breakdowns and totals for entities and tokens from the initial
 	// namespace data.
 	totalEntities, totalTokens, byNamespaceResponse, err := a.calculateByNamespaceResponseForQuery(ctx, pq.Namespaces)
@@ -1573,6 +1593,7 @@ func (a *ActivityLog) handleQuery(ctx context.Context, startTime, endTime time.T
 		// Add the current month's namespace data the precomputed query namespaces
 		byNamespaceResponse = append(byNamespaceResponse, byNamespaceResponseCurrent...)
 	}
+
 	// Sort clients within each namespace
 	a.sortALResponseNamespaces(byNamespaceResponse)
 
@@ -1586,11 +1607,13 @@ func (a *ActivityLog) handleQuery(ctx context.Context, startTime, endTime time.T
 		if err != nil {
 			return nil, err
 		}
+
 		// Add the namespace attribution for the current month to the newly computed current month value. Note
 		// that transformMonthBreakdowns calculates a superstruct of the required namespace struct due to its
 		// primary use-case being for precomputedQueryWorker, but we will reuse this code for brevity and extract
 		// the namespaces from it.
 		currentMonthNamespaceAttribution := a.transformMonthBreakdowns(partialByMonth)
+
 		// Ensure that there is only one element in this list -- if not, warn.
 		if len(currentMonthNamespaceAttribution) > 1 {
 			a.logger.Warn("more than one month worth of namespace and mount attribution calculated for "+
@@ -1608,7 +1631,18 @@ func (a *ActivityLog) handleQuery(ctx context.Context, startTime, endTime time.T
 	// Now populate the response based on breakdowns.
 	responseData := make(map[string]interface{})
 	responseData["start_time"] = pq.StartTime.Format(time.RFC3339)
-	responseData["end_time"] = pq.EndTime.Format(time.RFC3339)
+
+	// If we computed partial counts, we should return the actual end time we computed counts for, not the pre-computed
+	// query end time. If we don't do this, the end_time in the response doesn't match the actual data in the response,
+	// which is confusing. Note that regardless of what end time is given, if it falls within the current month, it will
+	// be set to the end of the current month. This is definitely suboptimal, and possibly confusing, but still an
+	// improvement over using the pre-computed query end time.
+	if computePartial {
+		responseData["end_time"] = endTime.Format(time.RFC3339)
+	} else {
+		responseData["end_time"] = pq.EndTime.Format(time.RFC3339)
+	}
+
 	responseData["by_namespace"] = byNamespaceResponse
 	responseData["total"] = &ResponseCounts{
 		DistinctEntities: distinctEntitiesResponse,
@@ -1731,6 +1765,11 @@ func (a *ActivityLog) HandleTokenUsage(ctx context.Context, entry *logical.Token
 
 	// Do not count root tokens in client count.
 	if entry.IsRoot() {
+		return
+	}
+
+	// Tokens created for the purpose of Link should bypass counting for billing purposes
+	if entry.InternalMeta != nil && entry.InternalMeta[IgnoreForBilling] == "true" {
 		return
 	}
 
@@ -2160,6 +2199,10 @@ func (a *ActivityLog) precomputedQueryWorker(ctx context.Context) error {
 // We expect the return value won't be checked, so log errors as they occur
 // (but for unit testing having the error return should help.)
 func (a *ActivityLog) retentionWorker(ctx context.Context, currentTime time.Time, retentionMonths int) error {
+	if a.core.activityLogConfig.DisableTimers {
+		return nil
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

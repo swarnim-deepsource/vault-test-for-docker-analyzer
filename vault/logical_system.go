@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"hash"
 	"net/http"
-	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -20,8 +19,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-
-	"golang.org/x/crypto/sha3"
 
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
@@ -32,10 +29,12 @@ import (
 	semver "github.com/hashicorp/go-version"
 	"github.com/hashicorp/vault/helper/hostutil"
 	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/helper/monitor"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/random"
+	"github.com/hashicorp/vault/helper/versions"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
@@ -44,6 +43,7 @@ import (
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/version"
 	"github.com/mitchellh/mapstructure"
+	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -84,7 +84,8 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 	}
 
 	b.Backend = &framework.Backend{
-		Help: strings.TrimSpace(sysHelpRoot),
+		RunningVersion: versions.DefaultBuiltinVersion,
+		Help:           strings.TrimSpace(sysHelpRoot),
 
 		PathsSpecial: &logical.Paths{
 			Root: []string{
@@ -112,6 +113,7 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 				"leases/lookup/*",
 				"storage/raft/snapshot-auto/config/*",
 				"leases",
+				"internal/inspect/*",
 			},
 
 			Unauthenticated: []string{
@@ -424,7 +426,7 @@ func (b *SystemBackend) handlePluginCatalogUntypedList(ctx context.Context, _ *l
 		}
 
 		// Sort for consistent ordering
-		sortVersionedPlugins(versionedPlugins)
+		sortVersionedPlugins(versioned)
 
 		versionedPlugins = append(versionedPlugins, versioned...)
 	}
@@ -472,9 +474,12 @@ func (b *SystemBackend) handlePluginCatalogUpdate(ctx context.Context, _ *logica
 		return nil, err
 	}
 
-	pluginVersion, err := getVersion(d)
+	pluginVersion, builtin, err := getVersion(d)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
+	}
+	if builtin {
+		return logical.ErrorResponse("version %q is not allowed because 'builtin' is a reserved metadata identifier", pluginVersion), nil
 	}
 
 	sha256 := d.Get("sha256").(string)
@@ -515,6 +520,9 @@ func (b *SystemBackend) handlePluginCatalogUpdate(ctx context.Context, _ *logica
 
 	err = b.Core.pluginCatalog.Set(ctx, pluginName, pluginType, pluginVersion, parts[0], args, env, sha256Bytes)
 	if err != nil {
+		if errors.Is(err, ErrPluginNotFound) || strings.HasPrefix(err.Error(), "plugin version mismatch") {
+			return logical.ErrorResponse(err.Error()), nil
+		}
 		return nil, err
 	}
 
@@ -542,7 +550,7 @@ func (b *SystemBackend) handlePluginCatalogRead(ctx context.Context, _ *logical.
 		return nil, err
 	}
 
-	pluginVersion, err := getVersion(d)
+	pluginVersion, _, err := getVersion(d)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
@@ -572,6 +580,11 @@ func (b *SystemBackend) handlePluginCatalogRead(ctx context.Context, _ *logical.
 		"version": plugin.Version,
 	}
 
+	if plugin.Builtin {
+		status, _ := b.Core.builtinRegistry.DeprecationStatus(plugin.Name, plugin.Type)
+		data["deprecation_status"] = status.String()
+	}
+
 	return &logical.Response{
 		Data: data,
 	}, nil
@@ -583,9 +596,12 @@ func (b *SystemBackend) handlePluginCatalogDelete(ctx context.Context, _ *logica
 		return logical.ErrorResponse("missing plugin name"), nil
 	}
 
-	pluginVersion, err := getVersion(d)
+	pluginVersion, builtin, err := getVersion(d)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
+	}
+	if builtin {
+		return logical.ErrorResponse("version %q cannot be deleted", pluginVersion), nil
 	}
 
 	var resp *logical.Response
@@ -611,12 +627,12 @@ func (b *SystemBackend) handlePluginCatalogDelete(ctx context.Context, _ *logica
 	return resp, nil
 }
 
-func getVersion(d *framework.FieldData) (string, error) {
-	version := d.Get("version").(string)
+func getVersion(d *framework.FieldData) (version string, builtin bool, err error) {
+	version = d.Get("version").(string)
 	if version != "" {
 		semanticVersion, err := semver.NewSemver(version)
 		if err != nil {
-			return "", fmt.Errorf("version %q is not a valid semantic version: %w", version, err)
+			return "", false, fmt.Errorf("version %q is not a valid semantic version: %w", version, err)
 		}
 
 		// Canonicalize the version string.
@@ -624,7 +640,7 @@ func getVersion(d *framework.FieldData) (string, error) {
 		version = "v" + semanticVersion.String()
 	}
 
-	return version, nil
+	return version, versions.IsBuiltinVersion(version), nil
 }
 
 func (b *SystemBackend) handlePluginReloadUpdate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -889,10 +905,9 @@ func (b *SystemBackend) mountInfo(ctx context.Context, entry *MountEntry) map[st
 		"external_entropy_access": entry.ExternalEntropyAccess,
 		"options":                 entry.Options,
 		"uuid":                    entry.UUID,
-		"version":                 entry.Version,
-		"sha":                     entry.Sha,
-		"running_version":         entry.RunningVersion,
-		"running_sha":             entry.RunningSha,
+		"plugin_version":          entry.Version,
+		"running_plugin_version":  entry.RunningVersion,
+		"running_sha256":          entry.RunningSha256,
 	}
 	entryConfig := map[string]interface{}{
 		"default_lease_ttl": int64(entry.Config.DefaultLeaseTTL.Seconds()),
@@ -921,6 +936,15 @@ func (b *SystemBackend) mountInfo(ctx context.Context, entry *MountEntry) map[st
 	}
 	if entry.Table == credentialTableType {
 		entryConfig["token_type"] = entry.Config.TokenType.String()
+	}
+	if entry.Config.UserLockoutConfig != nil {
+		userLockoutConfig := map[string]interface{}{
+			"user_lockout_counter_reset_duration": int64(entry.Config.UserLockoutConfig.LockoutCounterReset.Seconds()),
+			"user_lockout_threshold":              entry.Config.UserLockoutConfig.LockoutThreshold,
+			"user_lockout_duration":               int64(entry.Config.UserLockoutConfig.LockoutDuration.Seconds()),
+			"user_lockout_disable":                entry.Config.UserLockoutConfig.DisableLockout,
+		}
+		entryConfig["user_lockout_config"] = userLockoutConfig
 	}
 
 	// Add deprecation status only if it exists
@@ -992,14 +1016,6 @@ func (b *SystemBackend) handleMount(ctx context.Context, req *logical.Request, d
 	sealWrap := data.Get("seal_wrap").(bool)
 	externalEntropyAccess := data.Get("external_entropy_access").(bool)
 	options := data.Get("options").(map[string]string)
-	version := data.Get("version").(string)
-	if version != "" {
-		v, err := semver.NewSemver(version)
-		if err != nil {
-			return nil, err
-		}
-		version = "v" + v.String()
-	}
 
 	var config MountConfig
 	var apiConfig APIMountConfig
@@ -1105,6 +1121,11 @@ func (b *SystemBackend) handleMount(ctx context.Context, req *logical.Request, d
 		}
 	}
 
+	pluginVersion, resp, err := b.validateVersion(ctx, apiConfig.PluginVersion, logicalType, consts.PluginTypeSecrets)
+	if resp != nil || err != nil {
+		return resp, err
+	}
+
 	// Copy over the force no cache if set
 	if apiConfig.ForceNoCache {
 		config.ForceNoCache = true
@@ -1142,7 +1163,13 @@ func (b *SystemBackend) handleMount(ctx context.Context, req *logical.Request, d
 		SealWrap:              sealWrap,
 		ExternalEntropyAccess: externalEntropyAccess,
 		Options:               options,
-		Version:               version,
+		Version:               pluginVersion,
+	}
+
+	// Detect and handle deprecated secrets engines
+	resp, err = b.Core.handleDeprecatedMountEntry(ctx, me, consts.PluginTypeSecrets)
+	if err != nil {
+		return handleError(err)
 	}
 
 	// Attempt mount
@@ -1151,7 +1178,40 @@ func (b *SystemBackend) handleMount(ctx context.Context, req *logical.Request, d
 		return handleError(err)
 	}
 
-	return nil, nil
+	return resp, nil
+}
+
+func selectPluginVersion(ctx context.Context, sys logical.SystemView, pluginName string, pluginType consts.PluginType) (string, error) {
+	unversionedPlugin, err := sys.LookupPlugin(ctx, pluginName, pluginType)
+	if err == nil && !unversionedPlugin.Builtin {
+		// We'll select the unversioned plugin that's been registered.
+		return "", nil
+	}
+
+	// No version provided and no unversioned plugin of that name available.
+	// Pin to the current latest version if any versioned plugins are registered.
+	plugins, err := sys.ListVersionedPlugins(ctx, pluginType)
+	if err != nil {
+		return "", err
+	}
+
+	var versionedCandidates []pluginutil.VersionedPlugin
+	for _, plugin := range plugins {
+		if !plugin.Builtin && plugin.Name == pluginName && plugin.Version != "" {
+			versionedCandidates = append(versionedCandidates, plugin)
+		}
+	}
+
+	if len(versionedCandidates) != 0 {
+		// Sort in reverse order.
+		sort.SliceStable(versionedCandidates, func(i, j int) bool {
+			return versionedCandidates[i].SemanticVersion.GreaterThan(versionedCandidates[j].SemanticVersion)
+		})
+
+		return "v" + versionedCandidates[0].SemanticVersion.String(), nil
+	}
+
+	return "", nil
 }
 
 func (b *SystemBackend) handleReadMount(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
@@ -1546,8 +1606,19 @@ func (b *SystemBackend) handleTuneReadCommon(ctx context.Context, path string) (
 		resp.Data["allowed_managed_keys"] = rawVal.([]string)
 	}
 
+	if mountEntry.Config.UserLockoutConfig != nil {
+		resp.Data["user_lockout_counter_reset_duration"] = int64(mountEntry.Config.UserLockoutConfig.LockoutCounterReset.Seconds())
+		resp.Data["user_lockout_threshold"] = mountEntry.Config.UserLockoutConfig.LockoutThreshold
+		resp.Data["user_lockout_duration"] = int64(mountEntry.Config.UserLockoutConfig.LockoutDuration.Seconds())
+		resp.Data["user_lockout_disable"] = mountEntry.Config.UserLockoutConfig.DisableLockout
+	}
+
 	if len(mountEntry.Options) > 0 {
 		resp.Data["options"] = mountEntry.Options
+	}
+
+	if mountEntry.Version != "" {
+		resp.Data["plugin_version"] = mountEntry.Version
 	}
 
 	return resp, nil
@@ -1661,6 +1732,111 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 		}
 	}
 
+	// user-lockout config
+	{
+		var apiuserLockoutConfig APIUserLockoutConfig
+
+		userLockoutConfigMap := data.Get("user_lockout_config").(map[string]interface{})
+		var err error
+		if userLockoutConfigMap != nil && len(userLockoutConfigMap) != 0 {
+			err := mapstructure.Decode(userLockoutConfigMap, &apiuserLockoutConfig)
+			if err != nil {
+				return logical.ErrorResponse(
+						"unable to convert given user lockout config information"),
+					logical.ErrInvalidRequest
+			}
+
+			// Supported auth methods for user lockout configuration: ldap, approle, userpass
+			switch strings.ToLower(mountEntry.Type) {
+			case "ldap", "approle", "userpass":
+			default:
+				return logical.ErrorResponse("tuning of user lockout configuration for auth type %q not allowed", mountEntry.Type),
+					logical.ErrInvalidRequest
+
+			}
+		}
+
+		if len(userLockoutConfigMap) > 0 && mountEntry.Config.UserLockoutConfig == nil {
+			mountEntry.Config.UserLockoutConfig = &UserLockoutConfig{}
+		}
+
+		var oldUserLockoutThreshold uint64
+		var newUserLockoutDuration, oldUserLockoutDuration time.Duration
+		var newUserLockoutCounterReset, oldUserLockoutCounterReset time.Duration
+		var oldUserLockoutDisable bool
+
+		if apiuserLockoutConfig.LockoutThreshold != "" {
+			userLockoutThreshold, err := strconv.ParseUint(apiuserLockoutConfig.LockoutThreshold, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse user lockout threshold: %w", err)
+			}
+			oldUserLockoutThreshold = mountEntry.Config.UserLockoutConfig.LockoutThreshold
+			mountEntry.Config.UserLockoutConfig.LockoutThreshold = userLockoutThreshold
+		}
+
+		if apiuserLockoutConfig.LockoutDuration != "" {
+			oldUserLockoutDuration = mountEntry.Config.UserLockoutConfig.LockoutDuration
+			switch apiuserLockoutConfig.LockoutDuration {
+			case "":
+				newUserLockoutDuration = oldUserLockoutDuration
+			case "system":
+				newUserLockoutDuration = time.Duration(0)
+			default:
+				tmpUserLockoutDuration, err := parseutil.ParseDurationSecond(apiuserLockoutConfig.LockoutDuration)
+				if err != nil {
+					return handleError(err)
+				}
+				newUserLockoutDuration = tmpUserLockoutDuration
+
+			}
+			mountEntry.Config.UserLockoutConfig.LockoutDuration = newUserLockoutDuration
+		}
+
+		if apiuserLockoutConfig.LockoutCounterResetDuration != "" {
+			oldUserLockoutCounterReset = mountEntry.Config.UserLockoutConfig.LockoutCounterReset
+			switch apiuserLockoutConfig.LockoutCounterResetDuration {
+			case "":
+				newUserLockoutCounterReset = oldUserLockoutCounterReset
+			case "system":
+				newUserLockoutCounterReset = time.Duration(0)
+			default:
+				tmpUserLockoutCounterReset, err := parseutil.ParseDurationSecond(apiuserLockoutConfig.LockoutCounterResetDuration)
+				if err != nil {
+					return handleError(err)
+				}
+				newUserLockoutCounterReset = tmpUserLockoutCounterReset
+			}
+
+			mountEntry.Config.UserLockoutConfig.LockoutCounterReset = newUserLockoutCounterReset
+		}
+
+		if apiuserLockoutConfig.DisableLockout != nil {
+			oldUserLockoutDisable = mountEntry.Config.UserLockoutConfig.DisableLockout
+			userLockoutDisable := apiuserLockoutConfig.DisableLockout
+			mountEntry.Config.UserLockoutConfig.DisableLockout = *userLockoutDisable
+		}
+
+		// Update the mount table
+		if len(userLockoutConfigMap) > 0 {
+			switch {
+			case strings.HasPrefix(path, "auth/"):
+				err = b.Core.persistAuth(ctx, b.Core.auth, &mountEntry.Local)
+			default:
+				err = b.Core.persistMounts(ctx, b.Core.mounts, &mountEntry.Local)
+			}
+			if err != nil {
+				mountEntry.Config.UserLockoutConfig.LockoutCounterReset = oldUserLockoutCounterReset
+				mountEntry.Config.UserLockoutConfig.LockoutThreshold = oldUserLockoutThreshold
+				mountEntry.Config.UserLockoutConfig.LockoutDuration = oldUserLockoutDuration
+				mountEntry.Config.UserLockoutConfig.DisableLockout = oldUserLockoutDisable
+				return handleError(err)
+			}
+			if b.Core.logger.IsInfo() {
+				b.Core.logger.Info("tuning of user_lockout_config successful", "path", path)
+			}
+		}
+
+	}
 	if rawVal, ok := data.GetOk("description"); ok {
 		description := rawVal.(string)
 
@@ -1681,6 +1857,43 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 		}
 		if b.Core.logger.IsInfo() {
 			b.Core.logger.Info("mount tuning of description successful", "path", path, "description", description)
+		}
+	}
+
+	if rawVal, ok := data.GetOk("plugin_version"); ok {
+		version := rawVal.(string)
+		semanticVersion, err := semver.NewVersion(version)
+		if err != nil {
+			return logical.ErrorResponse("version %q is not a valid semantic version: %s", version, err), nil
+		}
+		version = "v" + semanticVersion.String()
+
+		// Lookup the version to ensure it exists in the catalog before committing.
+		pluginType := consts.PluginTypeSecrets
+		if strings.HasPrefix(path, "auth/") {
+			pluginType = consts.PluginTypeCredential
+		}
+		_, err = b.System().LookupPluginVersion(ctx, mountEntry.Type, pluginType, version)
+		if err != nil {
+			return handleError(err)
+		}
+
+		oldVersion := mountEntry.Version
+		mountEntry.Version = version
+
+		// Update the mount table
+		switch {
+		case strings.HasPrefix(path, "auth/"):
+			err = b.Core.persistAuth(ctx, b.Core.auth, &mountEntry.Local)
+		default:
+			err = b.Core.persistMounts(ctx, b.Core.mounts, &mountEntry.Local)
+		}
+		if err != nil {
+			mountEntry.Version = oldVersion
+			return handleError(err)
+		}
+		if b.Core.logger.IsInfo() {
+			b.Core.logger.Info("mount tuning of version successful", "path", path, "version", version)
 		}
 	}
 
@@ -2243,14 +2456,6 @@ func (b *SystemBackend) handleEnableAuth(ctx context.Context, req *logical.Reque
 	sealWrap := data.Get("seal_wrap").(bool)
 	externalEntropyAccess := data.Get("external_entropy_access").(bool)
 	options := data.Get("options").(map[string]string)
-	version := data.Get("version").(string)
-	if version != "" {
-		v, err := semver.NewSemver(version)
-		if err != nil {
-			return nil, err
-		}
-		version = "v" + v.String()
-	}
 
 	var config MountConfig
 	var apiConfig APIMountConfig
@@ -2344,6 +2549,11 @@ func (b *SystemBackend) handleEnableAuth(ctx context.Context, req *logical.Reque
 		}
 	}
 
+	pluginVersion, response, err := b.validateVersion(ctx, apiConfig.PluginVersion, logicalType, consts.PluginTypeCredential)
+	if response != nil || err != nil {
+		return response, err
+	}
+
 	if options != nil && options["version"] != "" {
 		return logical.ErrorResponse(fmt.Sprintf(
 				"auth method %q does not allow setting a version", logicalType)),
@@ -2382,7 +2592,12 @@ func (b *SystemBackend) handleEnableAuth(ctx context.Context, req *logical.Reque
 		SealWrap:              sealWrap,
 		ExternalEntropyAccess: externalEntropyAccess,
 		Options:               options,
-		Version:               version,
+		Version:               pluginVersion,
+	}
+
+	resp, err := b.Core.handleDeprecatedMountEntry(ctx, me, consts.PluginTypeCredential)
+	if err != nil {
+		return handleError(err)
 	}
 
 	// Attempt enabling
@@ -2390,7 +2605,71 @@ func (b *SystemBackend) handleEnableAuth(ctx context.Context, req *logical.Reque
 		b.Backend.Logger().Error("error occurred during enable credential", "path", me.Path, "error", err)
 		return handleError(err)
 	}
-	return nil, nil
+	return resp, nil
+}
+
+func (b *SystemBackend) validateVersion(ctx context.Context, version string, pluginName string, pluginType consts.PluginType) (string, *logical.Response, error) {
+	switch version {
+	case "":
+		var err error
+		version, err = selectPluginVersion(ctx, b.System(), pluginName, pluginType)
+		if err != nil {
+			return "", nil, err
+		}
+
+		if version != "" {
+			b.logger.Debug("pinning plugin version", "plugin type", pluginType.String(), "plugin name", pluginName, "plugin version", version)
+		}
+	default:
+		semanticVersion, err := semver.NewVersion(version)
+		if err != nil {
+			return "", logical.ErrorResponse("version %q is not a valid semantic version: %s", version, err), nil
+		}
+
+		// Canonicalize the version.
+		version = "v" + semanticVersion.String()
+
+		if version == versions.GetBuiltinVersion(pluginType, pluginName) {
+			unversionedPlugin, err := b.System().LookupPlugin(ctx, pluginName, pluginType)
+			if err == nil && !unversionedPlugin.Builtin {
+				// Builtin is overridden, return "not found" error.
+				return "", logical.ErrorResponse("%s plugin %q, version %s not found, as it is"+
+					" overridden by an unversioned plugin of the same name. Omit `plugin_version` to use the unversioned plugin", pluginType.String(), pluginName, version), nil
+			}
+
+			// Don't put the builtin version in storage. Ensures that builtins
+			// can always be overridden, and upgrades are much simpler to handle.
+			version = ""
+		}
+	}
+
+	// if a non-builtin version is requested for a builtin plugin, return an error
+	if version != "" {
+		switch pluginType {
+		case consts.PluginTypeSecrets:
+			aliased, ok := mountAliases[pluginName]
+			if ok {
+				pluginName = aliased
+			}
+			if _, ok = b.Core.logicalBackends[pluginName]; ok {
+				if version != versions.GetBuiltinVersion(pluginType, pluginName) {
+					return "", logical.ErrorResponse("cannot select non-builtin version of secrets plugin %s", pluginName), nil
+				}
+			}
+		case consts.PluginTypeCredential:
+			aliased, ok := credentialAliases[pluginName]
+			if ok {
+				pluginName = aliased
+			}
+			if _, ok = b.Core.credentialBackends[pluginName]; ok {
+				if version != versions.GetBuiltinVersion(pluginType, pluginName) {
+					return "", logical.ErrorResponse("cannot select non-builtin version of auth plugin %s", pluginName), nil
+				}
+			}
+		}
+	}
+
+	return version, nil, nil
 }
 
 // handleDisableAuth is used to disable a credential backend
@@ -4001,6 +4280,20 @@ func (b *SystemBackend) pathInternalCountersEntities(ctx context.Context, req *l
 	return resp, nil
 }
 
+func (b *SystemBackend) pathInternalInspectRouter(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	tag := d.Get("tag").(string)
+	inspectableRouter, err := b.Core.router.GetRecords(tag)
+	if err != nil {
+		return nil, err
+	}
+	resp := &logical.Response{
+		Data: map[string]interface{}{
+			tag: inspectableRouter,
+		},
+	}
+	return resp, nil
+}
+
 func (b *SystemBackend) pathInternalUIResultantACL(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	if req.ClientToken == "" {
 		// 204 -- no ACL
@@ -4241,20 +4534,36 @@ func (b *SystemBackend) pathInternalOpenAPI(ctx context.Context, req *logical.Re
 }
 
 type SealStatusResponse struct {
-	Type         string `json:"type"`
-	Initialized  bool   `json:"initialized"`
-	Sealed       bool   `json:"sealed"`
-	T            int    `json:"t"`
-	N            int    `json:"n"`
-	Progress     int    `json:"progress"`
-	Nonce        string `json:"nonce"`
-	Version      string `json:"version"`
-	BuildDate    string `json:"build_date"`
-	Migration    bool   `json:"migration"`
-	ClusterName  string `json:"cluster_name,omitempty"`
-	ClusterID    string `json:"cluster_id,omitempty"`
-	RecoverySeal bool   `json:"recovery_seal"`
-	StorageType  string `json:"storage_type,omitempty"`
+	Type              string   `json:"type"`
+	Initialized       bool     `json:"initialized"`
+	Sealed            bool     `json:"sealed"`
+	T                 int      `json:"t"`
+	N                 int      `json:"n"`
+	Progress          int      `json:"progress"`
+	Nonce             string   `json:"nonce"`
+	Version           string   `json:"version"`
+	BuildDate         string   `json:"build_date"`
+	Migration         bool     `json:"migration"`
+	ClusterName       string   `json:"cluster_name,omitempty"`
+	ClusterID         string   `json:"cluster_id,omitempty"`
+	RecoverySeal      bool     `json:"recovery_seal"`
+	StorageType       string   `json:"storage_type,omitempty"`
+	HCPLinkStatus     string   `json:"hcp_link_status,omitempty"`
+	HCPLinkResourceID string   `json:"hcp_link_resource_ID,omitempty"`
+	Warnings          []string `json:"warnings,omitempty"`
+}
+
+// getStatusWarnings exposes potentially dangerous overrides in the status response
+// currently, this only warns about VAULT_DISABLE_SERVER_SIDE_CONSISTENT_TOKENS,
+// but should be extended to report more warnings where appropriate
+func (core *Core) getStatusWarnings() []string {
+	var warnings []string
+	if core.GetCoreConfigInternal() != nil && core.GetCoreConfigInternal().DisableSSCTokens {
+		warnings = append(warnings, "Server Side Consistent Tokens are disabled, due to the "+
+			"VAULT_DISABLE_SERVER_SIDE_CONSISTENT_TOKENS environment variable being set. "+
+			"It is not recommended to run Vault for an extended period of time with this configuration.")
+	}
+	return warnings
 }
 
 func (core *Core) GetSealStatus(ctx context.Context) (*SealStatusResponse, error) {
@@ -4275,8 +4584,10 @@ func (core *Core) GetSealStatus(ctx context.Context) (*SealStatusResponse, error
 		return nil, err
 	}
 
+	hcpLinkStatus, resourceIDonHCP := core.GetHCPLinkStatus()
+
 	if sealConfig == nil {
-		return &SealStatusResponse{
+		s := &SealStatusResponse{
 			Type:         core.SealAccess().BarrierType().String(),
 			Initialized:  initialized,
 			Sealed:       true,
@@ -4284,7 +4595,14 @@ func (core *Core) GetSealStatus(ctx context.Context) (*SealStatusResponse, error
 			StorageType:  core.StorageType(),
 			Version:      version.GetVersion().VersionNumber(),
 			BuildDate:    version.BuildDate,
-		}, nil
+		}
+
+		if resourceIDonHCP != "" {
+			s.HCPLinkStatus = hcpLinkStatus
+			s.HCPLinkResourceID = resourceIDonHCP
+		}
+
+		return s, nil
 	}
 
 	// Fetch the local cluster name and identifier
@@ -4303,7 +4621,7 @@ func (core *Core) GetSealStatus(ctx context.Context) (*SealStatusResponse, error
 
 	progress, nonce := core.SecretProgress()
 
-	return &SealStatusResponse{
+	s := &SealStatusResponse{
 		Type:         sealConfig.Type,
 		Initialized:  initialized,
 		Sealed:       sealed,
@@ -4318,7 +4636,15 @@ func (core *Core) GetSealStatus(ctx context.Context) (*SealStatusResponse, error
 		ClusterID:    clusterID,
 		RecoverySeal: core.SealAccess().RecoveryKeySupported(),
 		StorageType:  core.StorageType(),
-	}, nil
+		Warnings:     core.getStatusWarnings(),
+	}
+
+	if resourceIDonHCP != "" {
+		s.HCPLinkStatus = hcpLinkStatus
+		s.HCPLinkResourceID = resourceIDonHCP
+	}
+
+	return s, nil
 }
 
 type LeaderResponse struct {
@@ -4451,42 +4777,10 @@ func (b *SystemBackend) rotateBarrierKey(ctx context.Context) error {
 
 func (b *SystemBackend) handleHAStatus(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	// We're always the leader if we're handling this request.
-	hostname, err := os.Hostname()
+	nodes, err := b.Core.getHAMembers()
 	if err != nil {
 		return nil, err
 	}
-
-	leader := HAStatusNode{
-		Hostname:       hostname,
-		APIAddress:     b.Core.redirectAddr,
-		ClusterAddress: b.Core.ClusterAddr(),
-		ActiveNode:     true,
-		Version:        version.GetVersion().Version,
-	}
-
-	if rb := b.Core.getRaftBackend(); rb != nil {
-		leader.UpgradeVersion = rb.EffectiveVersion()
-		leader.RedundancyZone = rb.RedundancyZone()
-	}
-
-	nodes := []HAStatusNode{leader}
-
-	for _, peerNode := range b.Core.GetHAPeerNodesCached() {
-		lastEcho := peerNode.LastEcho
-		nodes = append(nodes, HAStatusNode{
-			Hostname:       peerNode.Hostname,
-			APIAddress:     peerNode.APIAddress,
-			ClusterAddress: peerNode.ClusterAddress,
-			LastEcho:       &lastEcho,
-			Version:        peerNode.Version,
-			UpgradeVersion: peerNode.UpgradeVersion,
-			RedundancyZone: peerNode.RedundancyZone,
-		})
-	}
-
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].APIAddress < nodes[j].APIAddress
-	})
 
 	return &logical.Response{
 		Data: map[string]interface{}{
@@ -4539,28 +4833,35 @@ func (b *SystemBackend) handleVersionHistoryList(ctx context.Context, req *logic
 	return logical.ListResponseWithInfo(respKeys, respKeyInfo), nil
 }
 
-// getLogLevel returns the hclog.Level that corresponds with the provided level string.
-// This differs hclog.LevelFromString in that it supports additional level strings so
-// that in remains consistent with the handling found in the "vault server" command.
-func getLogLevel(logLevel string) (log.Level, error) {
-	var level log.Level
+func (b *SystemBackend) handleLoggersRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	b.Core.allLoggersLock.RLock()
+	defer b.Core.allLoggersLock.RUnlock()
 
-	switch logLevel {
-	case "trace":
-		level = log.Trace
-	case "debug":
-		level = log.Debug
-	case "notice", "info", "":
-		level = log.Info
-	case "warn", "warning":
-		level = log.Warn
-	case "err", "error":
-		level = log.Error
-	default:
-		return level, fmt.Errorf("unrecognized log level %q", logLevel)
+	loggers := make(map[string]interface{})
+	warnings := make([]string, 0)
+
+	for _, logger := range b.Core.allLoggers {
+		loggerName := logger.Name()
+
+		// ignore base logger
+		if loggerName == "" {
+			continue
+		}
+
+		logLevel, err := logging.TranslateLoggerLevel(logger)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("cannot translate level for %q: %s", loggerName, err.Error()))
+		} else {
+			loggers[loggerName] = logLevel
+		}
 	}
 
-	return level, nil
+	resp := &logical.Response{
+		Data:     loggers,
+		Warnings: warnings,
+	}
+
+	return resp, nil
 }
 
 func (b *SystemBackend) handleLoggersWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -4575,7 +4876,7 @@ func (b *SystemBackend) handleLoggersWrite(ctx context.Context, req *logical.Req
 		return logical.ErrorResponse("level is empty"), nil
 	}
 
-	level, err := getLogLevel(logLevel)
+	level, err := logging.ParseLogLevel(logLevel)
 	if err != nil {
 		return logical.ErrorResponse(fmt.Sprintf("invalid level provided: %s", err.Error())), nil
 	}
@@ -4586,7 +4887,7 @@ func (b *SystemBackend) handleLoggersWrite(ctx context.Context, req *logical.Req
 }
 
 func (b *SystemBackend) handleLoggersDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	level, err := getLogLevel(b.Core.logLevel)
+	level, err := logging.ParseLogLevel(b.Core.logLevel)
 	if err != nil {
 		return logical.ErrorResponse(fmt.Sprintf("log level from config is invalid: %s", err.Error())), nil
 	}
@@ -4596,10 +4897,61 @@ func (b *SystemBackend) handleLoggersDelete(ctx context.Context, req *logical.Re
 	return nil, nil
 }
 
+func (b *SystemBackend) handleLoggersByNameRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	nameRaw, nameOk := d.GetOk("name")
+	if !nameOk {
+		return logical.ErrorResponse("name is required"), nil
+	}
+
+	name := nameRaw.(string)
+	if name == "" {
+		return logical.ErrorResponse("name is empty"), nil
+	}
+
+	b.Core.allLoggersLock.RLock()
+	defer b.Core.allLoggersLock.RUnlock()
+
+	loggers := make(map[string]interface{})
+	warnings := make([]string, 0)
+
+	for _, logger := range b.Core.allLoggers {
+		loggerName := logger.Name()
+
+		// ignore base logger
+		if loggerName == "" {
+			continue
+		}
+
+		if loggerName == name {
+			logLevel, err := logging.TranslateLoggerLevel(logger)
+
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("cannot translate level for %q: %s", loggerName, err.Error()))
+			} else {
+				loggers[loggerName] = logLevel
+			}
+
+			break
+		}
+	}
+
+	resp := &logical.Response{
+		Data:     loggers,
+		Warnings: warnings,
+	}
+
+	return resp, nil
+}
+
 func (b *SystemBackend) handleLoggersByNameWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	nameRaw, nameOk := d.GetOk("name")
 	if !nameOk {
 		return logical.ErrorResponse("name is required"), nil
+	}
+
+	name := nameRaw.(string)
+	if name == "" {
+		return logical.ErrorResponse("name is empty"), nil
 	}
 
 	logLevelRaw, logLevelOk := d.GetOk("level")
@@ -4613,14 +4965,14 @@ func (b *SystemBackend) handleLoggersByNameWrite(ctx context.Context, req *logic
 		return logical.ErrorResponse("level is empty"), nil
 	}
 
-	level, err := getLogLevel(logLevel)
+	level, err := logging.ParseLogLevel(logLevel)
 	if err != nil {
 		return logical.ErrorResponse(fmt.Sprintf("invalid level provided: %s", err.Error())), nil
 	}
 
-	err = b.Core.SetLogLevelByName(nameRaw.(string), level)
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("invalid params: %s", err.Error())), nil
+	success := b.Core.SetLogLevelByName(name, level)
+	if !success {
+		return logical.ErrorResponse(fmt.Sprintf("logger %q not found", name)), nil
 	}
 
 	return nil, nil
@@ -4632,14 +4984,19 @@ func (b *SystemBackend) handleLoggersByNameDelete(ctx context.Context, req *logi
 		return logical.ErrorResponse("name is required"), nil
 	}
 
-	level, err := getLogLevel(b.Core.logLevel)
+	level, err := logging.ParseLogLevel(b.Core.logLevel)
 	if err != nil {
 		return logical.ErrorResponse(fmt.Sprintf("log level from config is invalid: %s", err.Error())), nil
 	}
 
-	err = b.Core.SetLogLevelByName(nameRaw.(string), level)
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("invalid params: %s", err.Error())), nil
+	name := nameRaw.(string)
+	if name == "" {
+		return logical.ErrorResponse("name is empty"), nil
+	}
+
+	success := b.Core.SetLogLevelByName(name, level)
+	if !success {
+		return logical.ErrorResponse(fmt.Sprintf("logger %q not found", name)), nil
 	}
 
 	return nil, nil
@@ -4881,6 +5238,10 @@ in the plugin catalog.`,
 
 	"tune_mount_options": {
 		`The options to pass into the backend. Should be a json object with string keys and values.`,
+	},
+
+	"tune_user_lockout_config": {
+		`The user lockout configuration to pass into the backend. Should be a json object with string keys and values.`,
 	},
 
 	"remount": {
@@ -5422,6 +5783,14 @@ This path responds to the following HTTP methods.
 	"internal-counters-entities": {
 		"Count of active entities in this Vault cluster.",
 		"Count of active entities in this Vault cluster.",
+	},
+	"internal-inspect-router": {
+		"Information on the entries in each of the trees in the router. Inspectable trees are uuid, accessor, storage, and root.",
+		`
+This path responds to the following HTTP methods.
+		GET /
+			Returns a list of entries in specified table
+		`,
 	},
 	"host-info": {
 		"Information about the host instance that this Vault server is running on.",
